@@ -50,18 +50,17 @@ run using pre-clustering to uphold the assumptions of the algorithm
 
 You can start with Seurats RPCA integration method for this project or explore others.
     •	Label cells using known cell type labels. We can utilize the already nicely annotated     Tabula Sapiens dataset to annotate all cells in our integrated dataset! Typically, this     is an application for machine learning methods.
-    o	scANVI (“single-cell ANnotation using Variational Inference”)
-    o	Transfer learning using scArches https://www.nature.com/articles/s41587-021-01001-7
+scANVI (“single-cell ANnotation using Variational Inference”)
+Transfer learning using scArches https://www.nature.com/articles/s41587-021-01001-7
     
     •	Cluster cells
-    o	Leiden or Louvain clustering are typically used on a nearest neighbor graph of the         low dimensional space (eg. PCA or integrated low dimensional space).
-    o	Think about coarse and fine groupings, how can we come up with them?
+    Leiden or Louvain clustering are typically used on a nearest neighbor graph of the   low dimensional space (eg. PCA or integrated low dimensional space). Think about coarse and fine groupings, how can we come up with them?
 
 Questions that you should keep in mind:
     •	Remember to always take a look at the output of every step – does the output make         sense?
     •	How do we evaluate the performance / sensibility of analysis steps?
+Example: Shannon entropy calculation on the cell type label distribution per cluster     to validate whether our cell type labels correspond to data driven grouping of cells we     produced.
 
-    o	Example: Shannon entropy calculation on the cell type label distribution per cluster     to validate whether our cell type labels correspond to data driven grouping of cells we     produced.
 
 Details and links
 •	SCRAN example implementation: https://github.com/bvieth/powsimR/blob/d9e49ace330214513761e4be37396e4afed96e86/R/utils_normalise.R#L434
