@@ -1,0 +1,292 @@
+---
+title: "Code_Club_Project_Data_building"
+output: html_document
+date: "2023-10-16"
+---
+
+
+```{r}
+library(future) #Parallelisation of tasks (https://www.futureverse.org/packages-over#View.html)
+plan("multicore", workers = 4)
+options(future.globals.maxSize = 6000 * 1024^2) 
+```
+
+```{r}
+# if (!requireNamespace("remotes", quietly = TRUE)) {
+#   install.packages("remotes")
+# }
+# remotes::install_github("mojaveazure/seurat-disk")
+
+library(SeuratDisk)
+library(Seurat)
+library(reticulate)
+```
+
+
+```{r}
+Convert("/Users/timmhaeneke/Downloads/TS_Lung.h5ad", dest = "h5seurat", overwrite = TRUE)
+# makes a file from a .h5ad in the folder of your data that you convert
+# the file is mace int he same location
+```
+
+```{r}
+library(reticulate)
+#reticulate::py_install("scanpy")
+sc <- import("scanpy", convert = F)
+
+#read the converted file
+lung_ad <- sc$read_h5ad("/Users/timmhaeneke/Downloads/TS_Lung.h5ad")
+```
+
+```{r}
+#Explore data architecture coming from anndata
+lung_ad
+```
+
+```{r}
+library(Matrix)
+
+mat <- lung_ad$layers["raw_counts"] # get raw counts from python sparse matrix 
+mat_r <- reticulate::py_to_r(mat)# convert from sparse matrix to R sparse Matrix, as found in counts
+str(mat_r)
+#t(mat_r) # transpose matrix, make sure to load transpose prior
+
+#get metadata with barcodes in them as rownames
+cell.annotation <- reticulate::py_to_r(lung_ad$obs)
+dim(cell.annotation); cell.annotation
+
+#get genenames from geneannotation rownmaes
+gene.annotation <- reticulate::py_to_r(lung_ad$var)
+dim(gene.annotation); gene.annotation
+
+
+# To use the gene id instead of the gene annotation for gene names
+gene.annotation$ensemblid
+gene.id <- gene.annotation$ensemblid
+dim(gene.id); gene.id
+
+#check by which methods were used for sequencing ( 10x, smartseq etc)
+unique(cell.annotation$method)
+
+
+#check all sizes of extracted data
+dim(gene.annotation); dim(cell.annotation); dim(mat_r)
+
+```
+
+
+
+```{r}
+#get rowname information to build a seurat object
+genes <- rownames(gene.annotation)
+gene.ids <- gene.annotation$ensemblid
+barcodes <-rownames(cell.annotation)
+
+
+#raw_gene_bc_matrices
+countmatrix<-mat_r
+rownames(countmatrix) <- barcodes 
+colnames(countmatrix) <- gene.ids
+#needs to be transposed as seurat is inversed in terms of rows vs. columns
+countmatrix<-t(countmatrix)
+```
+
+```{r}
+#The countmatrix of raw count which can be used in seurat ( gene names are the enselmb id)
+countmatrix
+Alldataobject <- CreateSeuratObject(countmatrix)
+
+#Add patient and method information as well as other metainfo to the metadata
+#Split datasets by method and donor
+
+
+Alldataobject$method <- cell.annotation$method
+Alldataobject$donor <- cell.annotation$donor
+Alldataobject$free_annotation <- cell.annotation$free_annotation
+Alldataobject$compartment <- cell.annotation$compartment
+
+#Make a combined label to split by method and donor
+Alldataobject$combined_method_donor <- paste0(cell.annotation$method, "_", cell.annotation$donor)
+
+#Split Seuratobject
+split.lungdata <- SplitObject(Alldataobject, split.by = "combined_method_donor")
+split.lungdata
+```
+
+```{r}
+split.lungdata <- lapply(X=split.lungdata, FUN = function(x) {
+  
+x <- SCTransform(x, vst.flavor = "v2", verbose = FALSE) %>%
+    RunPCA(npcs = 30, verbose = FALSE) %>%
+    RunUMAP(reduction = "pca", dims = 1:30, verbose = FALSE) %>%
+    FindNeighbors(reduction = "pca", dims = 1:30, verbose = FALSE) %>%
+    FindClusters(resolution = 0.7, verbose = FALSE)
+
+})
+
+DimPlot(split.lungdata[[1]], group.by = "free_annotation", label = T ) + DimPlot(split.lungdata[[1]] )
+DimPlot(split.lungdata[[2]], group.by = "free_annotation", label = T )
+DimPlot(split.lungdata[[3]], group.by = "free_annotation", label = T )
+DimPlot(split.lungdata[[4]], group.by = "free_annotation", label = T )
+DimPlot(split.lungdata[[5]], group.by = "free_annotation", label = T )
+
+```
+
+```{r}
+#scran normalisation Workflow
+
+
+# Install required packages
+
+#BiocManager::install("scran")
+#BiocManager::install("SingleCellExperiment")
+
+# Load libraries
+library(scran)
+library(SingleCellExperiment)
+
+# Define the .scranclust.calc function
+.scranclust.calc <- function(countData, PreclustNumber, verbose) {
+  if (verbose) { message(paste0("Deconvolution within clusters.")) }
+
+  sce <- SingleCellExperiment::SingleCellExperiment(assays = list(counts = as.matrix(countData)))
+
+  if(ncol(countData)<=14) {
+    clusters <- scran::quickCluster(sce, method="hclust", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=2, to=min(table(clusters))-1, by = 1))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+  if(ncol(countData)>14 & ncol(countData)<=50) {
+    clusters <- scran::quickCluster(sce, method="hclust", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=2, to=min(table(clusters))-1, length.out=6))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+  if(ncol(countData)>50 & ncol(countData)<=1000) {
+    clusters <- scran::quickCluster(sce, method="hclust", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=10, to=min(table(clusters))-1, length.out=6))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+  if(ncol(countData)>1000 & ncol(countData)<=5000) {
+    clusters <- scran::quickCluster(sce, method="hclust", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=20, to=min(table(clusters))-1, length.out=6))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+  if(ncol(countData)>5000) {
+    clusters <- scran::quickCluster(sce, method="igraph", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=20, to=min(table(clusters))-1, length.out=6))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+
+  names(sf) <- colnames(countData)
+  norm.counts <- t(t(countData)/sf)
+  res <- list(NormCounts=norm.counts, RoundNormCounts=round(norm.counts), size.factors=sf)
+  attr(res, 'normFramework') <- "scran"
+  return(res)
+}
+
+install.packages("dynamicTreeCut")
+library(dynamicTreeCut)
+# Suppose countmatrix is already loaded in your R environment
+# Apply the function
+result <- .scranclust.calc(seuratobject@assays$RNA@counts, PreclustNumber = 6, verbose = TRUE)  # Assuming PreclustNumber is 10, adjust as needed
+
+seuratbject@assays$RNA@data <- result$NormCounts
+#do this only after normal normalisation or after SCT, in these cases replace the seuratbject@assays$RNA@data slot with the resulted NormCounts and then run FindVariables again. 
+
+```
+
+
+```{r}
+genes 
+any(genes %in% c("IFNG"))
+```
+
+```{r}
+#TAKING ONLY ANNOTATED GENES
+
+#Try to only keep transcripts of known gene names
+
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# 
+# BiocManager::install("org.Hs.eg.db")
+
+library(org.Hs.eg.db)
+
+# Check how many genes are in the human genome 
+human_genes <- keys(org.Hs.eg.db, keytype = "SYMBOL")
+sum(human_genes %in% genes)
+
+```
+
+```{r}
+
+genes <- rownames(gene.annotation)
+gene.ids <- gene.annotation$ensemblid
+barcodes <-rownames(cell.annotation)
+
+length(barcodes)
+length(genes)
+
+#raw_gene_bc_matrices
+countmatrix.genes <- mat_r
+
+
+rownames(countmatrix.genes) <- barcodes 
+colnames(countmatrix.genes) <- genes
+#needs to be transposed as seurat is inversed in terms of rows vs. columns
+countmatrix.genes <- t(countmatrix.genes)#for some reason this was flipped might need to unflip
+
+countmatrix.genes #genes now as rows / cells as columns 
+```
+
+```{r}
+# Assuming count_matrix is your matrix and gene is your list of gene names
+selected_rows <- which(rownames(countmatrix.genes) %in% human_genes)
+filtered.gene.matrix <- countmatrix.genes[selected_rows, ]
+filtered.gene.matrix
+```
+
+```{r}
+Alldataobject.gene <- CreateSeuratObject(filtered.gene.matrix)
+
+#Add patient and method information as well as other metainfo to the metadata
+#Split datasets by method and donor
+
+
+Alldataobject.gene$method <- cell.annotation$method
+Alldataobject.gene$donor <- cell.annotation$donor
+Alldataobject.gene$free_annotation <- cell.annotation$free_annotation
+Alldataobject.gene$compartment <- cell.annotation$compartment
+
+#Make a combined label to split by method and donor
+Alldataobject.gene$combined_method_donor <- paste0(cell.annotation$method, "_", cell.annotation$donor)
+
+#Split Seuratobject
+split.lungdata.gene <- SplitObject(Alldataobject.gene, split.by = "combined_method_donor")
+split.lungdata.gene
+
+```
+
+```{r}
+split.lungdata.gene <- lapply(X=split.lungdata.gene, FUN = function(x) {
+  
+x <- SCTransform(x, vst.flavor = "v2", verbose = FALSE) %>%
+    RunPCA(npcs = 30, verbose = FALSE) %>%
+    RunUMAP(reduction = "pca", dims = 1:30, verbose = FALSE) %>%
+    FindNeighbors(reduction = "pca", dims = 1:30, verbose = FALSE) %>%
+    FindClusters(resolution = 0.7, verbose = FALSE)
+
+})
+
+DimPlot(split.lungdata.gene[[1]], group.by = "free_annotation", label = T ) + DimPlot(split.lungdata[[1]] )
+DimPlot(split.lungdata.gene[[2]], group.by = "free_annotation", label = T )
+DimPlot(split.lungdata.gene[[3]], group.by = "free_annotation", label = T )
+DimPlot(split.lungdata.gene[[4]], group.by = "free_annotation", label = T )
+DimPlot(split.lungdata.gene[[5]], group.by = "free_annotation", label = T )
+```
+```{r}
+FeaturePlot(split.lungdata.gene[[4]], features = c("IFI6", "IFI44L")) 
+DimPlot(split.lungdata.gene[[4]], group.by = "free_annotation", label = T  ) + NoLegend()
+```
+
