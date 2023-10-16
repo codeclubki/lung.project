@@ -19,6 +19,7 @@ a.	Is it even
 
 
 •	Data sources:
+
 o	 RNA: Columbia University/NYP COVID-19 Lung Atlas: 7 control samples ~30k cells
 https://singlecell.broadinstitute.org/single_cell/study/SCP1219/columbia-university-nyp-covid-19-lung-atlas#/
 
