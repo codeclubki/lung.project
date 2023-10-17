@@ -1,0 +1,453 @@
+---
+title: "02_Code_Club_Integration"
+output: html_document
+date: "2023-10-16"
+---
+
+```{r}
+library(Seurat)
+library(SeuratData)
+library(patchwork)
+#install.packages("tidyverse")
+library(tidyverse)
+
+#BiocManager::install('multtest')
+#install.packages('metap')
+
+#install.packages("dynamicTreeCut")
+library(dynamicTreeCut)
+
+library(ggplot2)
+library(cowplot)
+
+library(future) #Parallelisation of tasks (https://www.futureverse.org/packages-over#View.html)
+plan("multicore", workers = 4)
+options(future.globals.maxSize = 6000 * 1024^2) 
+
+```
+
+
+```{r}
+# install dataset
+InstallData("ifnb")
+# load dataset
+LoadData("ifnb")
+```
+
+
+```{r}
+unique(ifnb$stim)
+```
+
+```{r}
+ifnb.merged.only <- ifnb
+
+ifnb.merged.only <- NormalizeData(ifnb.merged.only)
+ifnb.merged.only <- FindVariableFeatures(ifnb.merged.only)
+ifnb.merged.only <- ScaleData(ifnb.merged.only, verbose = FALSE)
+ifnb.merged.only <- RunPCA(ifnb.merged.only, npcs = 30, verbose = FALSE)
+ifnb.merged.only <- RunUMAP(ifnb.merged.only, reduction = "pca", dims = 1:30)
+ifnb.merged.only <- FindNeighbors(ifnb.merged.only, reduction = "pca", dims = 1:30)
+ifnb.merged.only <- FindClusters(ifnb.merged.only, resolution = 0.5)
+
+DimPlot(ifnb.merged.only) + DimPlot(ifnb.merged.only, group.by = "stim") 
+```
+
+
+```{r}
+# SCRAN normalisation, you can try it but here it seems to actually strugle with downstream integration.
+library(scran)
+library(SingleCellExperiment)
+
+# Define the .scranclust.calc function
+.scranclust.calc <- function(countData, PreclustNumber, verbose) {
+  if (verbose) { message(paste0("Deconvolution within clusters.")) }
+
+  sce <- SingleCellExperiment::SingleCellExperiment(assays = list(counts = as.matrix(countData)))
+
+  if(ncol(countData)<=14) {
+    clusters <- scran::quickCluster(sce, method="hclust", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=2, to=min(table(clusters))-1, by = 1))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+  if(ncol(countData)>14 & ncol(countData)<=50) {
+    clusters <- scran::quickCluster(sce, method="hclust", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=2, to=min(table(clusters))-1, length.out=6))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+  if(ncol(countData)>50 & ncol(countData)<=1000) {
+    clusters <- scran::quickCluster(sce, method="hclust", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=10, to=min(table(clusters))-1, length.out=6))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+  if(ncol(countData)>1000 & ncol(countData)<=5000) {
+    clusters <- scran::quickCluster(sce, method="hclust", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=20, to=min(table(clusters))-1, length.out=6))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+  if(ncol(countData)>5000) {
+    clusters <- scran::quickCluster(sce, method="igraph", min.size=floor(PreclustNumber*0.75))
+    sizes <- unique(c(round(seq(from=20, to=min(table(clusters))-1, length.out=6))))
+    sf <- scran::calculateSumFactors(sce, sizes = sizes, clusters = clusters, positive = TRUE)
+  }
+
+  names(sf) <- colnames(countData)
+  norm.counts <- t(t(countData)/sf)
+  res <- list(NormCounts=norm.counts, RoundNormCounts=round(norm.counts), size.factors=sf)
+  attr(res, 'normFramework') <- "scran"
+  return(res)
+}
+
+
+
+```
+
+```{r}
+
+# split the dataset into a list of two seurat objects (stim and CTRL)
+ifnb.list <- SplitObject(ifnb, split.by = "stim")
+
+# normalize (here we use scran) and identify variable features for each dataset independently
+ifnb.list <- lapply(X = ifnb.list, FUN = function(x) {
+  
+    x <- NormalizeData(x)
+
+    ##Uncheck below and comment above if you want to try scran normalisation instead
+    
+    # x[["RNA"]]@data <- matrix(0, nrow = nrow(x), ncol=ncol(x))
+    # result <-.scranclust.calc(x@assays$RNA@counts, PreclustNumber = 100, verbose = TRUE) 
+    # x@assays$RNA@data <- result$NormCounts
+    
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+
+
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = ifnb.list)
+
+
+```
+
+```{r}
+immune.anchors <- FindIntegrationAnchors(object.list = ifnb.list, anchor.features = features)
+# this command creates an 'integrated' data assay
+immune.combined <- IntegrateData(anchorset = immune.anchors)
+```
+
+```{r}
+# specify that we will perform downstream analysis on the corrected data note that the
+# original unmodified data still resides in the 'RNA' assay
+DefaultAssay(immune.combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+immune.combined <- ScaleData(immune.combined, verbose = FALSE)
+immune.combined <- RunPCA(immune.combined, npcs = 30, verbose = FALSE)
+immune.combined <- RunUMAP(immune.combined, reduction = "pca", dims = 1:30)
+immune.combined <- FindNeighbors(immune.combined, reduction = "pca", dims = 1:30)
+immune.combined <- FindClusters(immune.combined, resolution = 0.5)
+# Visualization
+p1 <- DimPlot(immune.combined, reduction = "umap", group.by = "stim")
+p2 <- DimPlot(immune.combined, reduction = "umap", label = TRUE, repel = TRUE)
+p1 + p2
+```
+
+```{r}
+DimPlot(immune.combined, reduction = "umap", split.by = "stim")
+```
+
+```{r}
+
+#Identify conserved cell type markers irrespective of condition
+
+
+# For performing differential expression after integration, we switch back to the original
+# data, you could run this individually on each cluster (probably good to turn it into a function for this, that iterates through idents)
+DefaultAssay(immune.combined) <- "RNA"
+nk.markers <- FindConservedMarkers(immune.combined, ident.1 = 6, grouping.var = "stim", verbose = FALSE)
+head(nk.markers)
+```
+```{r}
+FeaturePlot(immune.combined, features = c("CD3D", "SELL", "CREM", "CD8A", "GNLY", "CD79A", "FCGR3A",
+    "CCL2", "PPBP"), min.cutoff = "q9")
+```
+```{r}
+immune.combined <- RenameIdents(immune.combined, `0` = "CD14 Mono", `1` = "CD4 Naive T", `2` = "CD4 Memory T",
+    `3` = "CD16 Mono", `4` = "B", `5` = "CD8 T", `6` = "NK", `7` = "T activated", `8` = "DC", `9` = "B Activated",
+    `10` = "Mk", `11` = "pDC", `12` = "Eryth", `13` = "Mono/Mk Doublets", `14` = "HSPC")
+DimPlot(immune.combined, label = TRUE)
+```
+```{r}
+Idents(immune.combined) <- factor(Idents(immune.combined), levels = c("HSPC", "Mono/Mk Doublets",
+    "pDC", "Eryth", "Mk", "DC", "CD14 Mono", "CD16 Mono", "B Activated", "B", "CD8 T", "NK", "T activated",
+    "CD4 Naive T", "CD4 Memory T"))
+markers.to.plot <- c("CD3D", "CREM", "HSPH1", "SELL", "GIMAP5", "CACYBP", "GNLY", "NKG7", "CCL5",
+    "CD8A", "MS4A1", "CD79A", "MIR155HG", "NME1", "FCGR3A", "VMO1", "CCL2", "S100A9", "HLA-DQA1",
+    "GPR183", "PPBP", "GNG11", "HBA2", "HBB", "TSPAN13", "IL3RA", "IGJ", "PRSS57")
+DotPlot(immune.combined, features = markers.to.plot, cols = c("blue", "red"), dot.scale = 4, split.by = "stim") +
+    RotatedAxis()
+```
+```{r}
+#Identify differential expressed genes across conditions
+
+library(ggplot2)
+library(cowplot)
+
+theme_set(theme_cowplot())
+t.cells <- subset(immune.combined, idents = "CD4 Naive T")
+Idents(t.cells) <- "stim"
+avg.t.cells <- as.data.frame(log1p(AverageExpression(t.cells, verbose = FALSE)$RNA))
+avg.t.cells$gene <- rownames(avg.t.cells)
+
+cd14.mono <- subset(immune.combined, idents = "CD14 Mono")
+Idents(cd14.mono) <- "stim"
+avg.cd14.mono <- as.data.frame(log1p(AverageExpression(cd14.mono, verbose = FALSE)$RNA))
+avg.cd14.mono$gene <- rownames(avg.cd14.mono)
+
+genes.to.label = c("ISG15", "LY6E", "IFI6", "ISG20", "MX1", "IFIT2", "IFIT1", "CXCL10", "CCL8")
+p1 <- ggplot(avg.t.cells, aes(CTRL, STIM)) + geom_point() + ggtitle("CD4 Naive T Cells")
+p1 <- LabelPoints(plot = p1, points = genes.to.label, repel = TRUE)
+p2 <- ggplot(avg.cd14.mono, aes(CTRL, STIM)) + geom_point() + ggtitle("CD14 Monocytes")
+p2 <- LabelPoints(plot = p2, points = genes.to.label, repel = TRUE)
+p1 + p2
+```
+```{r}
+#Use FindMarkers() to find the genes that are different between stimulated and control B cells. Notice that many of the top genes that show up here are the same as the ones we plotted earlier as core interferon response genes. Additionally, genes like CXCL10 which we saw were specific to monocyte and B cell interferon response show up as highly significant in this list as well. Also check out FindAllMarkers() to find all Markers between clusters, but this takes longer.
+
+immune.combined$celltype.stim <- paste(Idents(immune.combined), immune.combined$stim, sep = "_")
+immune.combined$celltype <- Idents(immune.combined)
+Idents(immune.combined) <- "celltype.stim"
+b.interferon.response <- FindMarkers(immune.combined, ident.1 = "B_STIM", ident.2 = "B_CTRL", verbose = FALSE)
+head(b.interferon.response, n = 15)
+
+```
+
+```{r}
+#Check out differences based on computed markers in the B cell cluster
+# as expected Interferon response seems to be a big difference here
+FeaturePlot(immune.combined, features = c("CD3D", "GNLY", "IFI6"), split.by = "stim", max.cutoff = 3,
+    cols = c("grey", "red"))
+```
+
+```{r}
+plots <- VlnPlot(immune.combined, features = c("LYZ", "ISG15", "CXCL10"), split.by = "stim", group.by = "celltype",
+    pt.size = 0, combine = FALSE)
+wrap_plots(plots = plots, ncol = 1)
+```
+
+```{r}
+#SCT integration workflow
+LoadData("ifnb")
+ifnb.list <- SplitObject(ifnb, split.by = "stim")
+ifnb.list <- lapply(X = ifnb.list, FUN = SCTransform)
+features <- SelectIntegrationFeatures(object.list = ifnb.list, nfeatures = 3000)
+ifnb.list <- PrepSCTIntegration(object.list = ifnb.list, anchor.features = features)
+
+```
+
+```{r}
+immune.anchors <- FindIntegrationAnchors(object.list = ifnb.list, normalization.method = "SCT",
+    anchor.features = features)
+immune.combined.sct <- IntegrateData(anchorset = immune.anchors, normalization.method = "SCT")
+```
+
+```{r}
+immune.combined.sct <- RunPCA(immune.combined.sct, verbose = FALSE)
+immune.combined.sct <- RunUMAP(immune.combined.sct, reduction = "pca", dims = 1:30)
+```
+
+```{r}
+p1 <- DimPlot(immune.combined.sct, reduction = "umap", group.by = "stim")
+p2 <- DimPlot(immune.combined.sct, reduction = "umap", group.by = "seurat_annotations", label = TRUE,
+    repel = TRUE)
+p1 + p2
+```
+
+#SCT workflow v2
+```{r}
+# install sctransform >= 0.3.3
+#install.packages("sctransform")
+#invoke sctransform - requires Seurat>=4.1
+library(sctransform)
+```
+
+```{r}
+ifnb.list <- SplitObject(ifnb, split.by = "stim")
+
+ifnb.list <- lapply(X = ifnb.list, FUN = function(x) {
+  
+   x <- SCTransform(x, vst.flavor = "v2", verbose = FALSE) %>%
+    RunPCA(npcs = 30, verbose = FALSE) # you can also just put RunPCA() with all PCs but you probably dont need them
+})
+```
+
+
+```{r}
+features <- SelectIntegrationFeatures(object.list = ifnb.list, nfeatures = 3000)
+ifnb.list <- PrepSCTIntegration(object.list = ifnb.list, anchor.features = features)
+immune.anchors <- FindIntegrationAnchors(object.list = ifnb.list, normalization.method = "SCT",
+    anchor.features = features)
+immune.combined.sct <- IntegrateData(anchorset = immune.anchors, normalization.method = "SCT")
+```
+
+```{r}
+immune.combined.sct <- RunPCA(immune.combined.sct, verbose = FALSE)
+#ElbowPlot(immune.combined.sct) # 15-20 but Satija claims pushing dims in SCT is beneficial for them
+
+immune.combined.sct <- RunUMAP(immune.combined.sct, reduction = "pca", dims = 1:30, verbose = FALSE)
+immune.combined.sct <- FindNeighbors(immune.combined.sct, reduction = "pca", dims = 1:30)
+immune.combined.sct <- FindClusters(immune.combined.sct, resolution = 0.3)
+```
+
+```{r}
+DimPlot(immune.combined.sct, reduction = "umap", group.by = "stim") 
+DimPlot(immune.combined.sct, reduction = "umap", group.by = "seurat_annotations", label = TRUE,
+    repel = TRUE)
+
+```
+
+
+```{r}
+
+#install.packages(reitulate)
+library(reticulate)
+# install dataset
+InstallData("ifnb")
+# load dataset
+LoadData("ifnb")
+
+
+#install.packages("remotes")
+#remotes::install_github("NMikolajewicz/scMiko")
+library(scMiko)
+#install scanorama into your reticulate environment via pip install scanorama in terminal 
+# you can check your reticulate environment with py_config()
+py_run_string("import scanorama")
+library(harmony)
+
+#install.packages("sctransform")
+# install glmGamPoi
+#if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install("glmGamPoi")
+# install sctransform from Github
+```
+
+```{r}
+#SCANORAMA integration using scMiko and 
+LoadData("ifnb")
+
+#Test if scMiko scanorama really works by testing it on the ifnb dataset quickly from Seurat DATA package
+# you should be able to run this without an error, otherwise you might need to install some dependencies in terminal 
+object <- runScanorama(ifnb, batch="stim", do.umap = T, dim=as.integer(30))
+object <- FindNeighbors(object, reduction = "pca", dims = 1:30)
+object <- FindClusters(object, resolution = 0.3)
+DimPlot(object) + DimPlot(object, group.by = "stim") 
+
+```
+
+
+```{r}
+#SCANORAMA WITHOUT SCT and more modifiable 
+ifnb.list <- SplitObject(ifnb, split.by = "stim")
+seuratobjectlist <- ifnb.list
+
+seuratobjectlist <- lapply(X = seuratobjectlist, FUN = function(x) {
+  
+    x <- NormalizeData(x)
+})
+
+
+
+assaylist <- list()
+genelist <- list()
+
+for(i in 1:length(seuratobjectlist)){
+   assaylist[[i]] <- t(as.matrix(GetAssayData(seuratobjectlist[[i]], "data")))
+   genelist[[i]] <- rownames(seuratobjectlist[[i]])
+}
+```
+
+```{r}
+integrated.data <- scanorama$integrate(assaylist, genelist)
+corrected.data <- scanorama$correct(assaylist, genelist, return_dense=TRUE)
+integrated.corrected.data <- scanorama$correct(assaylist, genelist, return_dimred=TRUE, return_dense=TRUE)
+```
+
+```{r}
+intdata <- lapply(integrated.corrected.data[[2]], t)
+panorama <- do.call(cbind, intdata)
+rownames(panorama) <- as.character(integrated.corrected.data[[3]])
+colnames(panorama) <- unlist(sapply(assaylist, rownames))
+
+intdimred <- do.call(rbind, integrated.corrected.data[[1]])
+colnames(intdimred) <- paste0("PC_", 1:100)
+
+#We also add standard deviations in order to draw Elbow Plots in Seurat
+
+stdevs <- apply(intdimred, MARGIN = 2, FUN = sd)
+```
+
+```{r}
+pan.seurat <- CreateSeuratObject(counts = panorama, assay = "pano",  project = "Integratiotest")
+
+  #Adding metadata from all previous objects
+pan.seurat@meta.data <- do.call(rbind, lapply(seuratobjectlist, function(x) x@meta.data))
+
+    # VERY IMPORTANT: make sure that the rownames of your metadata slot
+    # are the same as the colnames of your integrated expression matrix
+
+rownames(pan.seurat@meta.data) <- colnames(pan.seurat)
+rownames(intdimred) <- colnames(pan.seurat)
+
+pan.seurat[["pca"]] <- CreateDimReducObject(embeddings = intdimred, stdev = stdevs, key = "PC_", assay = "pano")
+```
+
+```{r}
+ElbowPlot(pan.seurat)
+pan.seurat <- RunUMAP(pan.seurat, reduction = "pca", dims = 1:20, verbose = FALSE)
+pan.seurat <- FindNeighbors(pan.seurat, dims = 1:20)
+pan.seurat <- FindClusters(pan.seurat, resolution = 0.3)
+
+
+#FindAllMarkers(pan.seurat)
+DimPlot(pan.seurat)
+DimPlot(pan.seurat, group.by = "seurat_annotations", label = TRUE, reduction="umap")
+DimPlot(pan.seurat, gro<up.by = "stim" )
+
+```
+
+
+```{r}
+#HARMONY Integration
+library(harmony)
+```
+
+```{r}
+
+Harmonysplit <- SplitObject(ifnb, split.by = "stim")
+ctrl<-Harmonysplit[[1]]
+stim<-Harmonysplit[[2]]
+ctrl <- NormalizeData(object = ctrl, verbose = FALSE)
+stim<-NormalizeData(object = stim, verbose = FALSE)
+stim$Dataset <- "stimd"
+ctrl$Dataset <- "ctrld"
+Harmony_ob <- merge(stim,ctrl)
+
+data <- FindVariableFeatures(object = Harmony_ob, nfeatures = 2000, verbose = FALSE, selection.method = 'vst')
+data <- ScaleData(data, verbose = FALSE)
+data <- RunPCA(data, npcs = 30, verbose = FALSE)
+```
+
+```{r}
+start <- Sys.time()
+data <- RunHarmony(data, "Dataset")
+print( Sys.time() - start )
+```
+
+```{r}
+data <- RunUMAP(data, reduction = "harmony", dims = 1:30)
+data <- FindNeighbors(data, dims = 1:30)
+data <- FindClusters(data, resolution = 0.5)
+DimPlot(data, group.by = "Dataset") +DimPlot(data) + DimPlot(data, group.by = "seurat_annotations")
+```
+
+
